@@ -1,0 +1,23 @@
+# eval_set.py — ground-truth questions. VERIFY each against the source PDFs.
+EVAL = [
+    {"q": "Is an MRI covered for a patient with a cardiac pacemaker?",
+     "expected": "DENY", "justification": "NCD 220.2 lists pacemakers as a contraindication."},
+    {"q": "Is MRI covered for diagnosing multiple sclerosis?",
+     "expected": "APPROVE", "justification": "MRI covered for CNS/neuro diagnosis incl. MS."},
+    {"q": "Is CPAP covered for obstructive sleep apnea with an AHI of 20 on polysomnography?",
+     "expected": "APPROVE", "justification": "AHI >=15 meets CPAP coverage criteria."},
+    {"q": "Is CPAP covered for OSA with an AHI of 8 and no documented symptoms?",
+     "expected": "DENY", "justification": "AHI 5-14 requires documented symptoms."},
+    {"q": "Is CPAP coverage permanent from the first prescription?",
+     "expected": "DENY", "justification": "Coverage initially limited to a 12-week trial period."},
+    {"q": "Is a home sleep test acceptable to diagnose OSA for CPAP?",
+     "expected": "APPROVE", "justification": "Home sleep test allowed under specified criteria."},
+    {"q": "Is MRI covered for a patient with a metallic aneurysm clip?",
+     "expected": "DENY", "justification": "Metallic vascular clips listed as contraindication."},
+    {"q": "Is a dental cleaning covered under these policies?",
+     "expected": "NEEDS_INFO", "justification": "Not addressed in the loaded policies."},
+    {"q": "Is cosmetic rhinoplasty covered under these policies?",
+     "expected": "NEEDS_INFO", "justification": "Not addressed in the loaded policies."},
+    {"q": "Is CPAP covered if the patient shows no benefit after the trial period?",
+     "expected": "DENY", "justification": "Continued coverage requires documented benefit."},
+]
