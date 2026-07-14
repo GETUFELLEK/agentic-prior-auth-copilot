@@ -1,0 +1,511 @@
+]633;E;for file in agent.py api.py api_models.py models.py retrieval.py ingest.py eval_decision.py\x3b do     echo\x3b     echo "============================================================"\x3b     echo "FILE: $file"\x3b     echo "============================================================"\x3b     sed -n '1,260p' "$file"\x3b done > current_project_code.txt;b064a79b-deb1-4e0c-b048-eacccb21a1c2]633;C
+============================================================
+FILE: agent.py
+============================================================
+
+import os
+from typing import Annotated, List, Optional, TypedDict
+
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+from models import Critique, Grade, PADecision
+from retrieval import hybrid_retrieve
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+MAX_RETRIEVE = 2
+MAX_CRITIQUE = 2
+
+llm = ChatOpenAI(
+    model=OPENAI_MODEL,
+    temperature=0,
+)
+
+
+# ---------------------------------------------------------------------------
+# LangGraph state
+# ---------------------------------------------------------------------------
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    question: str
+    query: str
+    documents: List[Document]
+    decision: Optional[dict]
+    sufficient: Optional[bool]
+    grounded: Optional[bool]
+    critique_feedback: str
+    r_attempts: int
+    c_attempts: int
+
+
+# ---------------------------------------------------------------------------
+# Structured-output LLMs
+# ---------------------------------------------------------------------------
+
+grader = llm.with_structured_output(Grade)
+proposer = llm.with_structured_output(PADecision)
+critic = llm.with_structured_output(Critique)
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def make_initial_state(question: str) -> State:
+    """Create a fresh LangGraph state for one prior-authorization request."""
+    return {
+        "messages": [HumanMessage(content=question)],
+        "question": question,
+        "query": "",
+        "documents": [],
+        "decision": None,
+        "sufficient": None,
+        "grounded": None,
+        "critique_feedback": "",
+        "r_attempts": 0,
+        "c_attempts": 0,
+    }
+
+
+def _format_documents(documents: List[Document]) -> str:
+    """Format retrieved policy documents for use in an LLM prompt."""
+    if not documents:
+        return "No policy context was retrieved."
+
+    return "\n\n---\n\n".join(
+        (
+            f"[Policy: {document.metadata.get('policy_file', 'unknown')}]\n"
+            f"{document.page_content}"
+        )
+        for document in documents
+    )
+
+
+def _validate_decision(raw_decision) -> PADecision:
+    """Convert either a dictionary or PADecision object into PADecision."""
+    if isinstance(raw_decision, PADecision):
+        return raw_decision
+
+    if isinstance(raw_decision, dict):
+        return PADecision.model_validate(raw_decision)
+
+    raise ValueError(
+        f"Unsupported decision type: {type(raw_decision).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graph nodes
+# ---------------------------------------------------------------------------
+
+def retrieve(state: State) -> dict:
+    """Retrieve relevant policy chunks using hybrid dense and BM25 search."""
+    query = state["query"] or state["question"]
+
+    documents = hybrid_retrieve(
+        query=query,
+        top_k=5,
+    )
+
+    return {
+        "documents": documents,
+        "r_attempts": state["r_attempts"] + 1,
+    }
+
+
+def grade(state: State) -> dict:
+    """Determine whether the retrieved context is sufficient and relevant."""
+    prompt = (
+        f"Question:\n{state['question']}\n\n"
+        f"Policy context:\n{_format_documents(state['documents'])}\n\n"
+        "Determine whether this context is both relevant and sufficient "
+        "to make a prior-authorization coverage decision."
+    )
+
+    result = grader.invoke(
+        [HumanMessage(content=prompt)]
+    )
+
+    return {
+        "sufficient": result.sufficient,
+    }
+
+
+def reformulate(state: State) -> dict:
+    """Rewrite the user's question into a more precise retrieval query."""
+    prompt = (
+        "The retrieved medical coverage-policy context was insufficient.\n\n"
+        "Rewrite the following question as a precise search query for medical "
+        "coverage policies. Include the procedure, diagnosis, device, test, "
+        "or clinical criteria that are important.\n\n"
+        "Return only the rewritten search query.\n\n"
+        f"Question:\n{state['question']}"
+    )
+
+    response = llm.invoke(
+        [HumanMessage(content=prompt)]
+    )
+
+    return {
+        "query": response.content.strip(),
+    }
+
+
+def propose(state: State) -> dict:
+    """Generate a structured prior-authorization decision."""
+    conversation_history = "\n".join(
+        f"{message.type}: {message.content}"
+        for message in state["messages"][:-1]
+    )
+
+    conversation_history = conversation_history[-1500:]
+
+    prompt_parts = [
+        (
+            "You are a prior-authorization decision-support assistant.\n"
+            "Make a decision using only the supplied policy context.\n"
+            "Do not invent clinical facts or policy requirements."
+        ),
+        (
+            "Return one of these decisions:\n"
+            "- APPROVE\n"
+            "- DENY\n"
+            "- NEEDS_INFO"
+        ),
+        (
+            "Cite the exact relevant policy language in cited_clauses.\n"
+            "If the policy context or patient information is insufficient, "
+            "choose NEEDS_INFO and clearly state what information is missing."
+        ),
+    ]
+
+    if conversation_history:
+        prompt_parts.append(
+            f"Conversation history:\n{conversation_history}"
+        )
+
+    feedback = state["critique_feedback"]
+
+    if feedback and feedback not in {
+        "human-approved",
+        "human-overridden",
+        "human-review-skipped",
+    }:
+        prompt_parts.append(
+            f"Reviewer feedback that must be addressed:\n{feedback}"
+        )
+
+    prompt_parts.extend(
+        [
+            f"Question:\n{state['question']}",
+            f"Policy context:\n{_format_documents(state['documents'])}",
+        ]
+    )
+
+    result = proposer.invoke(
+        [HumanMessage(content="\n\n".join(prompt_parts))]
+    )
+
+    return {
+        "decision": result.model_dump(),
+        "c_attempts": state["c_attempts"] + 1,
+    }
+
+
+def critique(state: State) -> dict:
+    """Check whether the proposed decision is grounded in policy context."""
+    decision = _validate_decision(state["decision"])
+
+    prompt = (
+        "Strictly review the draft prior-authorization decision against the "
+        "provided policy context.\n\n"
+        "Check all of the following:\n"
+        "1. The cited clauses are actually present in the policy context.\n"
+        "2. The rationale follows from the cited policy language.\n"
+        "3. The decision does not invent patient facts or requirements.\n"
+        "4. Unsupported claims are identified.\n\n"
+        f"Policy context:\n{_format_documents(state['documents'])}\n\n"
+        f"Draft decision: {decision.decision}\n"
+        f"Cited clauses: {decision.cited_clauses}\n"
+        f"Rationale: {decision.rationale}\n"
+        f"Missing information: {decision.missing_info}"
+    )
+
+    result = critic.invoke(
+        [HumanMessage(content=prompt)]
+    )
+
+    return {
+        "grounded": result.grounded,
+        "critique_feedback": result.reason,
+    }
+
+
+def human_review(state: State) -> dict:
+    """Request terminal review for DENY decisions outside evaluation/API mode."""
+    decision = _validate_decision(state["decision"])
+
+    if os.getenv("EVAL_MODE") == "1":
+        return {
+            "critique_feedback": "human-review-skipped",
+        }
+
+    print("\n[HUMAN REVIEW — DENY DECISION]")
+
+============================================================
+FILE: api.py
+============================================================
+
+import os
+import uuid
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Prevent API requests from waiting for terminal input on DENY decisions.
+os.environ.setdefault("EVAL_MODE", "1")
+
+from fastapi import FastAPI, HTTPException
+
+from agent import app as decision_graph
+from agent import make_initial_state
+from api_models import DecisionRequest, DecisionResponse, HealthResponse
+from models import PADecision
+
+
+api = FastAPI(
+    title="Agentic Prior-Authorization Copilot",
+    version="0.1.0",
+    description=(
+        "A policy-grounded prior-authorization decision-support API "
+        "implemented with LangGraph."
+    ),
+)
+
+
+@api.get("/health", response_model=HealthResponse, tags=["Operations"])
+def health() -> HealthResponse:
+    return HealthResponse(
+        status="healthy",
+        service="agentic-prior-auth-copilot",
+    )
+
+
+@api.post(
+    "/v1/decisions",
+    response_model=DecisionResponse,
+    tags=["Prior Authorization"],
+)
+def create_decision(request: DecisionRequest) -> DecisionResponse:
+    request_id = str(uuid.uuid4())
+
+    config = {
+        "configurable": {
+            "thread_id": request_id,
+        }
+    }
+
+    try:
+        result = decision_graph.invoke(
+            make_initial_state(request.question),
+            config,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="The prior-authorization workflow failed.",
+        ) from exc
+
+    raw_decision = result.get("decision")
+
+    if raw_decision is None:
+        raise HTTPException(
+            status_code=500,
+            detail="The workflow completed without producing a decision.",
+        )
+
+    if isinstance(raw_decision, dict):
+        decision = PADecision.model_validate(raw_decision)
+    else:
+        decision = raw_decision
+
+    return DecisionResponse(
+        request_id=request_id,
+        decision=decision.decision,
+        rationale=decision.rationale,
+        cited_clauses=decision.cited_clauses,
+        missing_info=decision.missing_info,
+        retrieval_attempts=result.get("r_attempts", 0),
+        critique_attempts=result.get("c_attempts", 0),
+    )
+
+============================================================
+FILE: api_models.py
+============================================================
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class DecisionRequest(BaseModel):
+    question: str = Field(
+        min_length=5,
+        max_length=5000,
+        description="Prior-authorization coverage question.",
+        examples=[
+            "Is an MRI covered for a patient with a cardiac pacemaker?"
+        ],
+    )
+
+
+class DecisionResponse(BaseModel):
+    request_id: str
+    decision: Literal["APPROVE", "DENY", "NEEDS_INFO"]
+    rationale: str
+    cited_clauses: list[str]
+    missing_info: str | None = None
+    retrieval_attempts: int
+    critique_attempts: int
+
+
+class HealthResponse(BaseModel):
+    status: Literal["healthy"]
+    service: str
+
+============================================================
+FILE: models.py
+============================================================
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
+
+class Grade(BaseModel):
+    sufficient: bool = Field(description="context is sufficient AND relevant to decide")
+    reason: str
+
+class PADecision(BaseModel):
+    decision: Literal["APPROVE", "DENY", "NEEDS_INFO"]
+    cited_clauses: List[str]
+    rationale: str
+    missing_info: Optional[str] = None
+
+class Critique(BaseModel):
+    grounded: bool = Field(description="every claim is supported by cited context, no hallucination")
+    reason: str
+============================================================
+FILE: retrieval.py
+============================================================
+import glob, os
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+# from sentence_transformers import CrossEncoder
+
+def _build_chunks():
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    docs = []
+    for path in glob.glob("policies/*.pdf"):
+        for c in splitter.split_documents(PyPDFLoader(path).load()):
+            c.metadata["policy_file"] = os.path.basename(path)
+            docs.append(c)
+    return docs
+
+emb = OpenAIEmbeddings(model="text-embedding-3-small")
+_dense = FAISS.load_local("faiss_index", emb,
+                          allow_dangerous_deserialization=True).as_retriever(search_kwargs={"k": 8})
+_bm25 = BM25Retriever.from_documents(_build_chunks()); _bm25.k = 8
+# _reranker = CrossEncoder("BAAI/bge-reranker-base")   # downloads ~1GB on first run
+
+def hybrid_retrieve(query, top_k=5):
+    pool = _dense.invoke(query) + _bm25.invoke(query)
+    seen, uniq = set(), []
+    for d in pool:
+        key = d.page_content[:200]
+        if key not in seen:
+            seen.add(key); uniq.append(d)
+    return uniq[:top_k]
+============================================================
+FILE: ingest.py
+============================================================
+import os, glob
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+
+paths = glob.glob("policies/*.pdf")
+print(f"Found {len(paths)} PDF(s): {paths}")
+if not paths:
+    raise SystemExit("No PDFs in ./policies/")
+
+emb = OpenAIEmbeddings(model="text-embedding-3-small")
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+docs = []
+for path in paths:
+    pages = PyPDFLoader(path).load()
+    print(f"  {os.path.basename(path)}: {len(pages)} page(s)")
+    chunks = splitter.split_documents(pages)
+    for c in chunks:
+        c.metadata["policy_file"] = os.path.basename(path)
+    docs.extend(chunks)
+
+print(f"Total chunks: {len(docs)}")
+if not docs:
+    raise SystemExit("0 chunks — PDFs may be scanned images needing OCR.")
+
+store = FAISS.from_documents(docs, emb)
+store.save_local("faiss_index")
+print(f"Indexed {len(docs)} chunks locally to ./faiss_index/")
+============================================================
+FILE: eval_decision.py
+============================================================
+import os
+os.environ["EVAL_MODE"] = "1"
+
+out = app.invoke(make_initial_state(q), cfg)
+from eval_set import EVAL
+
+def run():
+    rows, correct = [], 0
+    for i, item in enumerate(EVAL):
+        cfg = {"configurable": {"thread_id": f"eval-{i}"}}   # fresh memory per question
+        out = app.invoke(make_initial_state(item["q"]), cfg)
+        d = out["decision"]
+        got = d["decision"] if isinstance(d, dict) else d.decision   # works for dict or pydantic
+        ok = got == item["expected"]
+        correct += ok
+        rows.append((item["q"][:55], item["expected"], got, "OK" if ok else "X"))
+        from collections import defaultdict
+    by_cat = defaultdict(lambda: [0, 0])
+    for item, (_, _, got, _) in zip(EVAL, rows):
+        cat = item.get("category", "core")
+        by_cat[cat][1] += 1
+        by_cat[cat][0] += (got == item["expected"])
+    print("\nBy category:")
+    for cat, (c, n) in sorted(by_cat.items()):
+        print(f"  {cat:<22} {c}/{n} = {c/n:.0%}")
+
+    print(f"\n{'QUESTION':<57}{'EXP':<11}{'GOT':<11}RESULT")
+    print("-" * 90)
+    for q, e, g, r in rows:
+        print(f"{q:<57}{e:<11}{g:<11}{r}")
+    print("-" * 90)
+    print(f"Decision accuracy: {correct}/{len(EVAL)} = {correct/len(EVAL):.0%}")
+
+if __name__ == "__main__":
+    run()
