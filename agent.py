@@ -1,138 +1,444 @@
+
 import os
-from typing import TypedDict, Annotated, List, Literal, Optional
-from pydantic import BaseModel, Field
+from typing import Annotated, List, Optional, TypedDict
+
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+from models import Critique, Grade, PADecision
 from retrieval import hybrid_retrieve
-from models import Grade, PADecision, Critique
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-MAX_RETRIEVE, MAX_CRITIQUE = 2, 2
 
-# class Grade(BaseModel):
-#     sufficient: bool = Field(description="context is sufficient AND relevant to decide")
-#     reason: str
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-# class PADecision(BaseModel):
-#     decision: Literal["APPROVE", "DENY", "NEEDS_INFO"]
-#     cited_clauses: List[str]
-#     rationale: str
-#     missing_info: Optional[str] = None
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# class Critique(BaseModel):
-#     grounded: bool = Field(description="every claim is supported by cited context, no hallucination")
-#     reason: str
+MAX_RETRIEVE = 2
+MAX_CRITIQUE = 2
+
+llm = ChatOpenAI(
+    model=OPENAI_MODEL,
+    temperature=0,
+)
+
+
+# ---------------------------------------------------------------------------
+# LangGraph state
+# ---------------------------------------------------------------------------
+
 class State(TypedDict):
     messages: Annotated[list, add_messages]
     question: str
     query: str
     documents: List[Document]
-    decision: Optional[PADecision]
+    decision: Optional[dict]
     sufficient: Optional[bool]
     grounded: Optional[bool]
     critique_feedback: str
     r_attempts: int
     c_attempts: int
 
-def _fmt(docs):
-    return "\n\n---\n\n".join(f"[{d.metadata.get('policy_file','?')}] {d.page_content}" for d in docs)
 
-grader   = llm.with_structured_output(Grade)
+# ---------------------------------------------------------------------------
+# Structured-output LLMs
+# ---------------------------------------------------------------------------
+
+grader = llm.with_structured_output(Grade)
 proposer = llm.with_structured_output(PADecision)
-critic   = llm.with_structured_output(Critique)
-
-def retrieve(state):
-    q = state["query"] or state["question"]
-    return {"documents": hybrid_retrieve(q, top_k=5), "r_attempts": state["r_attempts"] + 1}
-
-def grade(state):
-    g = grader.invoke([HumanMessage(content=
-        f"Question: {state['question']}\n\nPolicy context:\n{_fmt(state['documents'])}\n\n"
-        "Is this context sufficient and relevant to make a coverage decision?")])
-    return {"sufficient": g.sufficient}
-
-def reformulate(state):
-    q = llm.invoke([HumanMessage(content=
-        "Retrieval was insufficient. Rewrite this as a more precise search query over medical "
-        f"coverage policies. Return only the query.\n\nQuestion: {state['question']}")]).content
-    return {"query": q}
-
-def propose(state):
-    fb = state["critique_feedback"]
-    hist = "\n".join(f"{m.type}: {m.content}" for m in state["messages"][:-1])[-1500:]
-    parts = ["You are a prior-authorization assistant. Decide using ONLY the policy context.",
-             "Cite exact clauses. If context is insufficient, choose NEEDS_INFO and fill missing_info."]
-    if hist: parts.append(f"Conversation so far:\n{hist}")
-    if fb and fb not in ("human-approved", "human-overridden"):
-        parts.append(f"Reviewer feedback to address:\n{fb}")
-    parts += [f"Question: {state['question']}", f"Policy context:\n{_fmt(state['documents'])}"]
-    return {"decision": proposer.invoke([HumanMessage(content="\n\n".join(parts))]).model_dump(),
-            "c_attempts": state["c_attempts"] + 1}
-
-def critique(state):
-    d = state["decision"]
-    c = critic.invoke([HumanMessage(content=
-        "Strictly check the draft against the policy context. Are the cited clauses actually present, "
-        "and does the decision follow the criteria? Flag any unsupported claim.\n\n"
-        f"Policy context:\n{_fmt(state['documents'])}\n\n"
-        f"Draft: {d.decision}\nCited: {d.cited_clauses}\nRationale: {d.rationale}")])
-    return {"grounded": c.grounded, "critique_feedback": c.reason}
+critic = llm.with_structured_output(Critique)
 
 
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
-def human_review(state):
-    d = state["decision"]
-    if os.getenv("EVAL_MODE") == "1":                 # batch eval: no prompt, log + pass through
-        return {"critique_feedback": "auto-approved (eval mode)"}
-    rationale = d["rationale"] if isinstance(d, dict) else d.rationale
-    print("\n  [HUMAN REVIEW — DENY decision]")
-    print("  Rationale:", rationale)
-    ok = input("  Approve this DENY? (y/n): ").strip().lower()
-    return {"critique_feedback": "human-approved" if ok == "y" else "human-overridden"}
+def make_initial_state(question: str) -> State:
+    """Create a fresh LangGraph state for one prior-authorization request."""
+    return {
+        "messages": [HumanMessage(content=question)],
+        "question": question,
+        "query": "",
+        "documents": [],
+        "decision": None,
+        "sufficient": None,
+        "grounded": None,
+        "critique_feedback": "",
+        "r_attempts": 0,
+        "c_attempts": 0,
+    }
 
-def finalize(state):
-    d = state["decision"]
-    return {"messages": [AIMessage(content=f"DECISION: {d.decision} — {d.rationale}")]}
 
-def after_grade(state):
-    if state["sufficient"]: return "propose"
-    return "reformulate" if state["r_attempts"] < MAX_RETRIEVE else "propose"
+def _format_documents(documents: List[Document]) -> str:
+    """Format retrieved policy documents for use in an LLM prompt."""
+    if not documents:
+        return "No policy context was retrieved."
 
-def after_critique(state):
+    return "\n\n---\n\n".join(
+        (
+            f"[Policy: {document.metadata.get('policy_file', 'unknown')}]\n"
+            f"{document.page_content}"
+        )
+        for document in documents
+    )
+
+
+def _validate_decision(raw_decision) -> PADecision:
+    """Convert either a dictionary or PADecision object into PADecision."""
+    if isinstance(raw_decision, PADecision):
+        return raw_decision
+
+    if isinstance(raw_decision, dict):
+        return PADecision.model_validate(raw_decision)
+
+    raise ValueError(
+        f"Unsupported decision type: {type(raw_decision).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graph nodes
+# ---------------------------------------------------------------------------
+
+def retrieve(state: State) -> dict:
+    """Retrieve relevant policy chunks using hybrid dense and BM25 search."""
+    query = state["query"] or state["question"]
+
+    documents = hybrid_retrieve(
+        query=query,
+        top_k=5,
+    )
+
+    return {
+        "documents": documents,
+        "r_attempts": state["r_attempts"] + 1,
+    }
+
+
+def grade(state: State) -> dict:
+    """Determine whether the retrieved context is sufficient and relevant."""
+    prompt = (
+        f"Question:\n{state['question']}\n\n"
+        f"Policy context:\n{_format_documents(state['documents'])}\n\n"
+        "Determine whether this context is both relevant and sufficient "
+        "to make a prior-authorization coverage decision."
+    )
+
+    result = grader.invoke(
+        [HumanMessage(content=prompt)]
+    )
+
+    return {
+        "sufficient": result.sufficient,
+    }
+
+
+def reformulate(state: State) -> dict:
+    """Rewrite the user's question into a more precise retrieval query."""
+    prompt = (
+        "The retrieved medical coverage-policy context was insufficient.\n\n"
+        "Rewrite the following question as a precise search query for medical "
+        "coverage policies. Include the procedure, diagnosis, device, test, "
+        "or clinical criteria that are important.\n\n"
+        "Return only the rewritten search query.\n\n"
+        f"Question:\n{state['question']}"
+    )
+
+    response = llm.invoke(
+        [HumanMessage(content=prompt)]
+    )
+
+    return {
+        "query": response.content.strip(),
+    }
+
+
+def propose(state: State) -> dict:
+    """Generate a structured prior-authorization decision."""
+    conversation_history = "\n".join(
+        f"{message.type}: {message.content}"
+        for message in state["messages"][:-1]
+    )
+
+    conversation_history = conversation_history[-1500:]
+
+    prompt_parts = [
+        (
+            "You are a prior-authorization decision-support assistant.\n"
+            "Make a decision using only the supplied policy context.\n"
+            "Do not invent clinical facts or policy requirements."
+        ),
+        (
+            "Return one of these decisions:\n"
+            "- APPROVE\n"
+            "- DENY\n"
+            "- NEEDS_INFO"
+        ),
+        (
+            "Cite the exact relevant policy language in cited_clauses.\n"
+            "If the policy context or patient information is insufficient, "
+            "choose NEEDS_INFO and clearly state what information is missing."
+        ),
+    ]
+
+    if conversation_history:
+        prompt_parts.append(
+            f"Conversation history:\n{conversation_history}"
+        )
+
+    feedback = state["critique_feedback"]
+
+    if feedback and feedback not in {
+        "human-approved",
+        "human-overridden",
+        "human-review-skipped",
+    }:
+        prompt_parts.append(
+            f"Reviewer feedback that must be addressed:\n{feedback}"
+        )
+
+    prompt_parts.extend(
+        [
+            f"Question:\n{state['question']}",
+            f"Policy context:\n{_format_documents(state['documents'])}",
+        ]
+    )
+
+    result = proposer.invoke(
+        [HumanMessage(content="\n\n".join(prompt_parts))]
+    )
+
+    return {
+        "decision": result.model_dump(),
+        "c_attempts": state["c_attempts"] + 1,
+    }
+
+
+def critique(state: State) -> dict:
+    """Check whether the proposed decision is grounded in policy context."""
+    decision = _validate_decision(state["decision"])
+
+    prompt = (
+        "Strictly review the draft prior-authorization decision against the "
+        "provided policy context.\n\n"
+        "Check all of the following:\n"
+        "1. The cited clauses are actually present in the policy context.\n"
+        "2. The rationale follows from the cited policy language.\n"
+        "3. The decision does not invent patient facts or requirements.\n"
+        "4. Unsupported claims are identified.\n\n"
+        f"Policy context:\n{_format_documents(state['documents'])}\n\n"
+        f"Draft decision: {decision.decision}\n"
+        f"Cited clauses: {decision.cited_clauses}\n"
+        f"Rationale: {decision.rationale}\n"
+        f"Missing information: {decision.missing_info}"
+    )
+
+    result = critic.invoke(
+        [HumanMessage(content=prompt)]
+    )
+
+    return {
+        "grounded": result.grounded,
+        "critique_feedback": result.reason,
+    }
+
+
+def human_review(state: State) -> dict:
+    """Request terminal review for DENY decisions outside evaluation/API mode."""
+    decision = _validate_decision(state["decision"])
+
+    if os.getenv("EVAL_MODE") == "1":
+        return {
+            "critique_feedback": "human-review-skipped",
+        }
+
+    print("\n[HUMAN REVIEW — DENY DECISION]")
+    print("Rationale:", decision.rationale)
+
+    if decision.cited_clauses:
+        print("Cited clauses:")
+
+        for clause in decision.cited_clauses:
+            print("-", clause)
+
+    answer = input(
+        "\nApprove this DENY decision? (y/n): "
+    ).strip().lower()
+
+    if answer == "y":
+        return {
+            "critique_feedback": "human-approved",
+        }
+
+    return {
+        "critique_feedback": "human-overridden",
+    }
+
+
+def finalize(state: State) -> dict:
+    """Add the final structured decision to the conversation messages."""
+    decision = _validate_decision(state["decision"])
+
+    message = (
+        f"DECISION: {decision.decision}\n"
+        f"RATIONALE: {decision.rationale}"
+    )
+
+    if decision.cited_clauses:
+        message += (
+            "\nCITED CLAUSES: "
+            + "; ".join(decision.cited_clauses)
+        )
+
+    if decision.missing_info:
+        message += (
+            f"\nMISSING INFORMATION: {decision.missing_info}"
+        )
+
+    return {
+        "messages": [AIMessage(content=message)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routing functions
+# ---------------------------------------------------------------------------
+
+def after_grade(state: State) -> str:
+    """Choose whether to decide or reformulate and retrieve again."""
+    if state["sufficient"]:
+        return "propose"
+
+    if state["r_attempts"] < MAX_RETRIEVE:
+        return "reformulate"
+
+    return "propose"
+
+
+def after_critique(state: State) -> str:
+    """Retry unsupported decisions or route to review/finalization."""
     if not state["grounded"] and state["c_attempts"] < MAX_CRITIQUE:
         return "propose"
-    return "human_review" if state["decision"].decision == "DENY" else "finalize"
 
-g = StateGraph(State)
-for n, f in [("retrieve", retrieve), ("grade", grade), ("reformulate", reformulate),
-             ("propose", propose), ("critique", critique),
-             ("human_review", human_review), ("finalize", finalize)]:
-    g.add_node(n, f)
-g.add_edge(START, "retrieve")
-g.add_edge("retrieve", "grade")
-g.add_conditional_edges("grade", after_grade, {"propose": "propose", "reformulate": "reformulate"})
-g.add_edge("reformulate", "retrieve")
-g.add_edge("propose", "critique")
-g.add_conditional_edges("critique", after_critique,
-                        {"propose": "propose", "human_review": "human_review", "finalize": "finalize"})
-g.add_edge("human_review", "finalize")
-g.add_edge("finalize", END)
-app = g.compile(checkpointer=MemorySaver())
+    decision = _validate_decision(state["decision"])
+
+    if decision.decision == "DENY":
+        return "human_review"
+
+    return "finalize"
+
+
+# ---------------------------------------------------------------------------
+# Build and compile the LangGraph workflow
+# ---------------------------------------------------------------------------
+
+graph = StateGraph(State)
+
+graph.add_node("retrieve", retrieve)
+graph.add_node("grade", grade)
+graph.add_node("reformulate", reformulate)
+graph.add_node("propose", propose)
+graph.add_node("critique", critique)
+graph.add_node("human_review", human_review)
+graph.add_node("finalize", finalize)
+
+graph.add_edge(START, "retrieve")
+graph.add_edge("retrieve", "grade")
+
+graph.add_conditional_edges(
+    "grade",
+    after_grade,
+    {
+        "propose": "propose",
+        "reformulate": "reformulate",
+    },
+)
+
+graph.add_edge("reformulate", "retrieve")
+graph.add_edge("propose", "critique")
+
+graph.add_conditional_edges(
+    "critique",
+    after_critique,
+    {
+        "propose": "propose",
+        "human_review": "human_review",
+        "finalize": "finalize",
+    },
+)
+
+graph.add_edge("human_review", "finalize")
+graph.add_edge("finalize", END)
+
+app = graph.compile(
+    checkpointer=MemorySaver()
+)
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Run the prior-authorization copilot interactively."""
+    print(
+        "Prior-auth copilot — ask a coverage question "
+        "(press Ctrl-C to exit)."
+    )
+
+    question_number = 0
+
+    while True:
+        try:
+            question = input("\nQ: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+
+        if not question:
+            continue
+
+        question_number += 1
+
+        config = {
+            "configurable": {
+                "thread_id": f"cli-{question_number}",
+            }
+        }
+
+        try:
+            result = app.invoke(
+                make_initial_state(question),
+                config,
+            )
+
+            decision = _validate_decision(result["decision"])
+
+            print(f"\nDECISION: {decision.decision}")
+            print(f"Rationale: {decision.rationale}")
+
+            if decision.cited_clauses:
+                print("Cited clauses:")
+
+                for clause in decision.cited_clauses:
+                    print("-", clause)
+
+            if decision.missing_info:
+                print(
+                    "Missing information:",
+                    decision.missing_info,
+                )
+
+        except Exception as exc:
+            print(
+                f"\nThe prior-authorization workflow failed: {exc}"
+            )
+
 
 if __name__ == "__main__":
-    cfg = {"configurable": {"thread_id": "demo"}}
-    print("Prior-auth copilot — ask a coverage question (Ctrl-C to exit).")
-    while True:
-        q = input("\nQ: ").strip()
-        if not q: continue
-        out = app.invoke({"messages": [HumanMessage(content=q)], "question": q, "query": "",
-                          "documents": [], "decision": None, "sufficient": None, "grounded": None,
-                          "critique_feedback": "", "r_attempts": 0, "c_attempts": 0}, cfg)
-        d = out["decision"]
-        print(f"\nDECISION: {d.decision}\nRationale: {d.rationale}")
-        if d.cited_clauses: print("Cited:", "; ".join(d.cited_clauses))
-        if d.missing_info:  print("Missing:", d.missing_info)
+    main()

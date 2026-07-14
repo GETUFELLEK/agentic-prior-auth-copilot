@@ -4,3 +4,28 @@ __pycache__/
 .env
 faiss_index/
 .DS_Store
+
+# Secrets
+.env
+.env.*
+
+# Keep the template
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.venv/
+
+# Local vector index
+faiss_index/
+
+# macOS
+.DS_Store
+
+__pycache__/
+*.pyc
