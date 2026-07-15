@@ -1,95 +1,101 @@
 
-import os
-from typing import Annotated, List, Optional, TypedDict
+"""LangGraph orchestration for prior-authorization decisions."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from models import Critique, Grade, PADecision
-from retrieval import hybrid_retrieve
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-MAX_RETRIEVE = 2
-MAX_CRITIQUE = 2
-
-llm = ChatOpenAI(
-    model=OPENAI_MODEL,
-    temperature=0,
+from prior_auth.config import get_settings
+from prior_auth.llm import get_chat_model
+from prior_auth.retrieval import HybridPolicyRetriever, get_retriever
+from prior_auth.schemas import (
+    Critique,
+    Grade,
+    PADecision,
+    ReviewMode,
 )
+from prior_auth.services.decision import (
+    critique_decision,
+    propose_decision,
+)
+from prior_auth.services.grading import (
+    grade_context,
+    reformulate_query,
+)
+from prior_auth.services.review import review_denial
 
 
-# ---------------------------------------------------------------------------
-# LangGraph state
-# ---------------------------------------------------------------------------
+RouteAfterGrade = Literal["reformulate", "propose"]
+RouteAfterCritique = Literal[
+    "propose",
+    "human_review",
+    "finalize",
+]
 
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
+
+class PriorAuthState(TypedDict):
+    """Shared state passed between LangGraph nodes."""
+
+    messages: Annotated[list[BaseMessage], add_messages]
+
     question: str
     query: str
-    documents: List[Document]
-    decision: Optional[dict]
-    sufficient: Optional[bool]
-    grounded: Optional[bool]
+    documents: list[Document]
+
+    decision: dict[str, Any] | None
+    sufficient: bool | None
+    grounded: bool | None
+
+    grade_reason: str
     critique_feedback: str
-    r_attempts: int
-    c_attempts: int
+    human_review_status: str
+    review_mode: ReviewMode
+
+    retrieval_attempts: int
+    critique_attempts: int
 
 
-# ---------------------------------------------------------------------------
-# Structured-output LLMs
-# ---------------------------------------------------------------------------
+def make_initial_state(
+    question: str,
+    *,
+    review_mode: ReviewMode = "skip",
+) -> PriorAuthState:
+    """Create a fresh state for one prior-authorization request."""
+    normalized_question = question.strip()
 
-grader = llm.with_structured_output(Grade)
-proposer = llm.with_structured_output(PADecision)
-critic = llm.with_structured_output(Critique)
+    if not normalized_question:
+        raise ValueError("question must not be empty.")
 
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-def make_initial_state(question: str) -> State:
-    """Create a fresh LangGraph state for one prior-authorization request."""
     return {
-        "messages": [HumanMessage(content=question)],
-        "question": question,
+        "messages": [
+            HumanMessage(content=normalized_question),
+        ],
+        "question": normalized_question,
         "query": "",
         "documents": [],
         "decision": None,
         "sufficient": None,
         "grounded": None,
+        "grade_reason": "",
         "critique_feedback": "",
-        "r_attempts": 0,
-        "c_attempts": 0,
+        "human_review_status": "not-required",
+        "review_mode": review_mode,
+        "retrieval_attempts": 0,
+        "critique_attempts": 0,
     }
 
 
-def _format_documents(documents: List[Document]) -> str:
-    """Format retrieved policy documents for use in an LLM prompt."""
-    if not documents:
-        return "No policy context was retrieved."
-
-    return "\n\n---\n\n".join(
-        (
-            f"[Policy: {document.metadata.get('policy_file', 'unknown')}]\n"
-            f"{document.page_content}"
-        )
-        for document in documents
-    )
-
-
-def _validate_decision(raw_decision) -> PADecision:
-    """Convert either a dictionary or PADecision object into PADecision."""
+def validate_decision(
+    raw_decision: object,
+) -> PADecision:
+    """Convert graph state data into a validated PADecision."""
     if isinstance(raw_decision, PADecision):
         return raw_decision
 
@@ -97,348 +103,315 @@ def _validate_decision(raw_decision) -> PADecision:
         return PADecision.model_validate(raw_decision)
 
     raise ValueError(
-        f"Unsupported decision type: {type(raw_decision).__name__}"
+        "The workflow has not produced a valid decision."
     )
 
 
-# ---------------------------------------------------------------------------
-# Graph nodes
-# ---------------------------------------------------------------------------
+def build_graph(
+    *,
+    retriever: HybridPolicyRetriever | Any | None = None,
+    chat_model: Any | None = None,
+    checkpointer: Any | None = None,
+):
+    """
+    Build and compile the prior-authorization workflow.
 
-def retrieve(state: State) -> dict:
-    """Retrieve relevant policy chunks using hybrid dense and BM25 search."""
-    query = state["query"] or state["question"]
+    Dependencies can be injected for unit tests. When omitted, production
+    implementations are created lazily.
+    """
+    settings = get_settings()
 
-    documents = hybrid_retrieve(
-        query=query,
-        top_k=5,
+    policy_retriever = (
+        retriever
+        if retriever is not None
+        else get_retriever()
     )
 
-    return {
-        "documents": documents,
-        "r_attempts": state["r_attempts"] + 1,
-    }
-
-
-def grade(state: State) -> dict:
-    """Determine whether the retrieved context is sufficient and relevant."""
-    prompt = (
-        f"Question:\n{state['question']}\n\n"
-        f"Policy context:\n{_format_documents(state['documents'])}\n\n"
-        "Determine whether this context is both relevant and sufficient "
-        "to make a prior-authorization coverage decision."
+    model = (
+        chat_model
+        if chat_model is not None
+        else get_chat_model()
     )
 
-    result = grader.invoke(
-        [HumanMessage(content=prompt)]
-    )
+    grader = model.with_structured_output(Grade)
+    proposer = model.with_structured_output(PADecision)
+    critic = model.with_structured_output(Critique)
 
-    return {
-        "sufficient": result.sufficient,
-    }
+    def retrieve_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Retrieve policy documents for the current query."""
+        query = state["query"] or state["question"]
 
-
-def reformulate(state: State) -> dict:
-    """Rewrite the user's question into a more precise retrieval query."""
-    prompt = (
-        "The retrieved medical coverage-policy context was insufficient.\n\n"
-        "Rewrite the following question as a precise search query for medical "
-        "coverage policies. Include the procedure, diagnosis, device, test, "
-        "or clinical criteria that are important.\n\n"
-        "Return only the rewritten search query.\n\n"
-        f"Question:\n{state['question']}"
-    )
-
-    response = llm.invoke(
-        [HumanMessage(content=prompt)]
-    )
-
-    return {
-        "query": response.content.strip(),
-    }
-
-
-def propose(state: State) -> dict:
-    """Generate a structured prior-authorization decision."""
-    conversation_history = "\n".join(
-        f"{message.type}: {message.content}"
-        for message in state["messages"][:-1]
-    )
-
-    conversation_history = conversation_history[-1500:]
-
-    prompt_parts = [
-        (
-            "You are a prior-authorization decision-support assistant.\n"
-            "Make a decision using only the supplied policy context.\n"
-            "Do not invent clinical facts or policy requirements."
-        ),
-        (
-            "Return one of these decisions:\n"
-            "- APPROVE\n"
-            "- DENY\n"
-            "- NEEDS_INFO"
-        ),
-        (
-            "Cite the exact relevant policy language in cited_clauses.\n"
-            "If the policy context or patient information is insufficient, "
-            "choose NEEDS_INFO and clearly state what information is missing."
-        ),
-    ]
-
-    if conversation_history:
-        prompt_parts.append(
-            f"Conversation history:\n{conversation_history}"
+        documents = policy_retriever.retrieve(
+            query,
+            top_k=settings.retrieval_top_k,
         )
 
-    feedback = state["critique_feedback"]
+        return {
+            "documents": documents,
+            "retrieval_attempts": (
+                state["retrieval_attempts"] + 1
+            ),
+        }
 
-    if feedback and feedback not in {
-        "human-approved",
-        "human-overridden",
-        "human-review-skipped",
-    }:
-        prompt_parts.append(
-            f"Reviewer feedback that must be addressed:\n{feedback}"
+    def grade_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Grade retrieved context for relevance and sufficiency."""
+        result = grade_context(
+            question=state["question"],
+            documents=state["documents"],
+            grader=grader,
         )
 
-    prompt_parts.extend(
-        [
-            f"Question:\n{state['question']}",
-            f"Policy context:\n{_format_documents(state['documents'])}",
+        return {
+            "sufficient": result.sufficient,
+            "grade_reason": result.reason,
+        }
+
+    def reformulate_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Rewrite the question for another retrieval attempt."""
+        query = reformulate_query(
+            question=state["question"],
+            chat_model=model,
+        )
+
+        return {
+            "query": query,
+        }
+
+    def propose_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Generate a structured policy-grounded decision."""
+        decision = propose_decision(
+            question=state["question"],
+            documents=state["documents"],
+            proposer=proposer,
+            critique_feedback=state[
+                "critique_feedback"
+            ],
+        )
+
+        return {
+            "decision": decision.model_dump(),
+            "critique_attempts": (
+                state["critique_attempts"] + 1
+            ),
+        }
+
+    def critique_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Evaluate whether the proposed decision is grounded."""
+        decision = validate_decision(
+            state["decision"]
+        )
+
+        critique = critique_decision(
+            decision=decision,
+            documents=state["documents"],
+            critic=critic,
+        )
+
+        return {
+            "grounded": critique.grounded,
+            "critique_feedback": critique.reason,
+        }
+
+    def human_review_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Apply interactive or skipped review for a denial."""
+        decision = validate_decision(
+            state["decision"]
+        )
+
+        review_status = review_denial(
+            decision=decision,
+            review_mode=state["review_mode"],
+        )
+
+        return {
+            "human_review_status": review_status,
+        }
+
+    def finalize_node(
+        state: PriorAuthState,
+    ) -> dict[str, Any]:
+        """Add a readable final decision to message history."""
+        decision = validate_decision(
+            state["decision"]
+        )
+
+        message_parts = [
+            f"DECISION: {decision.decision}",
+            f"RATIONALE: {decision.rationale}",
         ]
-    )
 
-    result = proposer.invoke(
-        [HumanMessage(content="\n\n".join(prompt_parts))]
-    )
-
-    return {
-        "decision": result.model_dump(),
-        "c_attempts": state["c_attempts"] + 1,
-    }
-
-
-def critique(state: State) -> dict:
-    """Check whether the proposed decision is grounded in policy context."""
-    decision = _validate_decision(state["decision"])
-
-    prompt = (
-        "Strictly review the draft prior-authorization decision against the "
-        "provided policy context.\n\n"
-        "Check all of the following:\n"
-        "1. The cited clauses are actually present in the policy context.\n"
-        "2. The rationale follows from the cited policy language.\n"
-        "3. The decision does not invent patient facts or requirements.\n"
-        "4. Unsupported claims are identified.\n\n"
-        f"Policy context:\n{_format_documents(state['documents'])}\n\n"
-        f"Draft decision: {decision.decision}\n"
-        f"Cited clauses: {decision.cited_clauses}\n"
-        f"Rationale: {decision.rationale}\n"
-        f"Missing information: {decision.missing_info}"
-    )
-
-    result = critic.invoke(
-        [HumanMessage(content=prompt)]
-    )
-
-    return {
-        "grounded": result.grounded,
-        "critique_feedback": result.reason,
-    }
-
-
-def human_review(state: State) -> dict:
-    """Request terminal review for DENY decisions outside evaluation/API mode."""
-    decision = _validate_decision(state["decision"])
-
-    if os.getenv("EVAL_MODE") == "1":
-        return {
-            "critique_feedback": "human-review-skipped",
-        }
-
-    print("\n[HUMAN REVIEW — DENY DECISION]")
-    print("Rationale:", decision.rationale)
-
-    if decision.cited_clauses:
-        print("Cited clauses:")
-
-        for clause in decision.cited_clauses:
-            print("-", clause)
-
-    answer = input(
-        "\nApprove this DENY decision? (y/n): "
-    ).strip().lower()
-
-    if answer == "y":
-        return {
-            "critique_feedback": "human-approved",
-        }
-
-    return {
-        "critique_feedback": "human-overridden",
-    }
-
-
-def finalize(state: State) -> dict:
-    """Add the final structured decision to the conversation messages."""
-    decision = _validate_decision(state["decision"])
-
-    message = (
-        f"DECISION: {decision.decision}\n"
-        f"RATIONALE: {decision.rationale}"
-    )
-
-    if decision.cited_clauses:
-        message += (
-            "\nCITED CLAUSES: "
-            + "; ".join(decision.cited_clauses)
-        )
-
-    if decision.missing_info:
-        message += (
-            f"\nMISSING INFORMATION: {decision.missing_info}"
-        )
-
-    return {
-        "messages": [AIMessage(content=message)],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Routing functions
-# ---------------------------------------------------------------------------
-
-def after_grade(state: State) -> str:
-    """Choose whether to decide or reformulate and retrieve again."""
-    if state["sufficient"]:
-        return "propose"
-
-    if state["r_attempts"] < MAX_RETRIEVE:
-        return "reformulate"
-
-    return "propose"
-
-
-def after_critique(state: State) -> str:
-    """Retry unsupported decisions or route to review/finalization."""
-    if not state["grounded"] and state["c_attempts"] < MAX_CRITIQUE:
-        return "propose"
-
-    decision = _validate_decision(state["decision"])
-
-    if decision.decision == "DENY":
-        return "human_review"
-
-    return "finalize"
-
-
-# ---------------------------------------------------------------------------
-# Build and compile the LangGraph workflow
-# ---------------------------------------------------------------------------
-
-graph = StateGraph(State)
-
-graph.add_node("retrieve", retrieve)
-graph.add_node("grade", grade)
-graph.add_node("reformulate", reformulate)
-graph.add_node("propose", propose)
-graph.add_node("critique", critique)
-graph.add_node("human_review", human_review)
-graph.add_node("finalize", finalize)
-
-graph.add_edge(START, "retrieve")
-graph.add_edge("retrieve", "grade")
-
-graph.add_conditional_edges(
-    "grade",
-    after_grade,
-    {
-        "propose": "propose",
-        "reformulate": "reformulate",
-    },
-)
-
-graph.add_edge("reformulate", "retrieve")
-graph.add_edge("propose", "critique")
-
-graph.add_conditional_edges(
-    "critique",
-    after_critique,
-    {
-        "propose": "propose",
-        "human_review": "human_review",
-        "finalize": "finalize",
-    },
-)
-
-graph.add_edge("human_review", "finalize")
-graph.add_edge("finalize", END)
-
-app = graph.compile(
-    checkpointer=MemorySaver()
-)
-
-
-# ---------------------------------------------------------------------------
-# Command-line interface
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    """Run the prior-authorization copilot interactively."""
-    print(
-        "Prior-auth copilot — ask a coverage question "
-        "(press Ctrl-C to exit)."
-    )
-
-    question_number = 0
-
-    while True:
-        try:
-            question = input("\nQ: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting.")
-            break
-
-        if not question:
-            continue
-
-        question_number += 1
-
-        config = {
-            "configurable": {
-                "thread_id": f"cli-{question_number}",
-            }
-        }
-
-        try:
-            result = app.invoke(
-                make_initial_state(question),
-                config,
+        if decision.cited_clauses:
+            message_parts.append(
+                "CITED CLAUSES: "
+                + "; ".join(decision.cited_clauses)
             )
 
-            decision = _validate_decision(result["decision"])
+        if decision.missing_info:
+            message_parts.append(
+                "MISSING INFORMATION: "
+                + decision.missing_info
+            )
 
-            print(f"\nDECISION: {decision.decision}")
-            print(f"Rationale: {decision.rationale}")
-
-            if decision.cited_clauses:
-                print("Cited clauses:")
-
-                for clause in decision.cited_clauses:
-                    print("-", clause)
-
-            if decision.missing_info:
-                print(
-                    "Missing information:",
-                    decision.missing_info,
+        return {
+            "messages": [
+                AIMessage(
+                    content="\n".join(message_parts)
                 )
+            ],
+        }
 
-        except Exception as exc:
-            print(
-                f"\nThe prior-authorization workflow failed: {exc}"
-            )
+    def route_after_grade(
+        state: PriorAuthState,
+    ) -> RouteAfterGrade:
+        """Choose between another retrieval and decision generation."""
+        if state["sufficient"]:
+            return "propose"
+
+        if (
+            state["retrieval_attempts"]
+            < settings.max_retrieval_attempts
+        ):
+            return "reformulate"
+
+        return "propose"
+
+    def route_after_critique(
+        state: PriorAuthState,
+    ) -> RouteAfterCritique:
+        """Retry unsupported drafts or continue to completion."""
+        if (
+            state["grounded"] is False
+            and state["critique_attempts"]
+            < settings.max_critique_attempts
+        ):
+            return "propose"
+
+        decision = validate_decision(
+            state["decision"]
+        )
+
+        if decision.decision == "DENY":
+            return "human_review"
+
+        return "finalize"
+
+    builder = StateGraph(PriorAuthState)
+
+    builder.add_node("retrieve", retrieve_node)
+    builder.add_node("grade", grade_node)
+    builder.add_node(
+        "reformulate",
+        reformulate_node,
+    )
+    builder.add_node("propose", propose_node)
+    builder.add_node("critique", critique_node)
+    builder.add_node(
+        "human_review",
+        human_review_node,
+    )
+    builder.add_node("finalize", finalize_node)
+
+    builder.add_edge(START, "retrieve")
+    builder.add_edge("retrieve", "grade")
+
+    builder.add_conditional_edges(
+        "grade",
+        route_after_grade,
+        {
+            "reformulate": "reformulate",
+            "propose": "propose",
+        },
+    )
+
+    builder.add_edge(
+        "reformulate",
+        "retrieve",
+    )
+
+    builder.add_edge(
+        "propose",
+        "critique",
+    )
+
+    builder.add_conditional_edges(
+        "critique",
+        route_after_critique,
+        {
+            "propose": "propose",
+            "human_review": "human_review",
+            "finalize": "finalize",
+        },
+    )
+
+    builder.add_edge(
+        "human_review",
+        "finalize",
+    )
+
+    builder.add_edge(
+        "finalize",
+        END,
+    )
+
+    graph_checkpointer = (
+        checkpointer
+        if checkpointer is not None
+        else InMemorySaver()
+    )
+
+    return builder.compile(
+        checkpointer=graph_checkpointer
+    )
 
 
-if __name__ == "__main__":
-    main()
+@lru_cache(maxsize=1)
+def get_graph():
+    """Build the production graph only when first requested."""
+    return build_graph()
+
+
+def clear_graph_cache() -> None:
+    """Clear the cached production graph, primarily for tests."""
+    get_graph.cache_clear()
+
+
+def run_decision(
+    *,
+    question: str,
+    thread_id: str,
+    review_mode: ReviewMode = "skip",
+) -> PriorAuthState:
+    """Execute one prior-authorization request."""
+    if not thread_id.strip():
+        raise ValueError(
+            "thread_id must not be empty."
+        )
+
+    graph = get_graph()
+
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+        }
+    }
+
+    return graph.invoke(
+        make_initial_state(
+            question,
+            review_mode=review_mode,
+        ),
+        config,
+    )
+
