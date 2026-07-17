@@ -1,84 +1,172 @@
 
-import os
+"""FastAPI application for the prior-authorization copilot."""
+
+from __future__ import annotations
+
+import logging
 import uuid
+from collections.abc import Callable
+from typing import Any
 
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, status
 
-load_dotenv()
-
-# Prevent API requests from waiting for terminal input on DENY decisions.
-os.environ.setdefault("EVAL_MODE", "1")
-
-from fastapi import FastAPI, HTTPException
-
-from agent import app as decision_graph
-from agent import make_initial_state
-from api_models import DecisionRequest, DecisionResponse, HealthResponse
-from models import PADecision
-
-
-api = FastAPI(
-    title="Agentic Prior-Authorization Copilot",
-    version="0.1.0",
-    description=(
-        "A policy-grounded prior-authorization decision-support API "
-        "implemented with LangGraph."
-    ),
+from prior_auth.config import get_settings
+from prior_auth.graph import (
+    PriorAuthState,
+    get_graph,
+    make_initial_state,
+    validate_decision,
+)
+from prior_auth.schemas import (
+    DecisionRequest,
+    DecisionResponse,
+    HealthResponse,
 )
 
 
-@api.get("/health", response_model=HealthResponse, tags=["Operations"])
-def health() -> HealthResponse:
-    return HealthResponse(
-        status="healthy",
-        service="agentic-prior-auth-copilot",
+logger = logging.getLogger(__name__)
+
+GraphProvider = Callable[[], Any]
+
+
+def create_app(
+    *,
+    graph_provider: GraphProvider = get_graph,
+) -> FastAPI:
+    """
+    Create and configure the FastAPI application.
+
+    graph_provider is injectable so API tests can use a fake graph
+    without loading FAISS or calling OpenAI.
+    """
+    settings = get_settings()
+
+    application = FastAPI(
+        title=settings.app_name,
+        version=settings.app_version,
+        description=(
+            "Policy-grounded prior-authorization decision support "
+            "using hybrid retrieval, LangGraph orchestration, "
+            "structured decision generation, critique, and "
+            "human-review routing."
+        ),
     )
 
+    @application.get(
+        "/health",
+        response_model=HealthResponse,
+        tags=["Operations"],
+        summary="Check service health",
+    )
+    def health() -> HealthResponse:
+        """
+        Return lightweight process health.
 
-@api.post(
-    "/v1/decisions",
-    response_model=DecisionResponse,
-    tags=["Prior Authorization"],
-)
-def create_decision(request: DecisionRequest) -> DecisionResponse:
-    request_id = str(uuid.uuid4())
+        This endpoint deliberately does not initialize OpenAI or FAISS.
+        """
+        return HealthResponse(
+            status="healthy",
+            service=settings.app_name,
+            version=settings.app_version,
+            environment=settings.environment,
+        )
 
-    config = {
-        "configurable": {
-            "thread_id": request_id,
+    @application.post(
+        "/v1/decisions",
+        response_model=DecisionResponse,
+        status_code=status.HTTP_200_OK,
+        tags=["Prior Authorization"],
+        summary="Generate a prior-authorization decision",
+    )
+    def create_decision(
+        request: DecisionRequest,
+    ) -> DecisionResponse:
+        """
+        Execute the prior-authorization workflow for one question.
+
+        API requests use review_mode='skip' because an HTTP request
+        cannot pause for terminal input. A persistent human-review
+        workflow will be introduced separately.
+        """
+        request_id = str(uuid.uuid4())
+
+        config = {
+            "configurable": {
+                "thread_id": request_id,
+            }
         }
-    }
 
-    try:
-        result = decision_graph.invoke(
-            make_initial_state(request.question),
-            config,
+        try:
+            graph = graph_provider()
+
+            result: PriorAuthState = graph.invoke(
+                make_initial_state(
+                    request.question,
+                    review_mode="skip",
+                ),
+                config,
+            )
+
+            decision = validate_decision(
+                result.get("decision")
+            )
+
+        except ValueError as exc:
+            logger.warning(
+                "Invalid prior-authorization workflow result. "
+                "request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": (
+                        "The workflow could not produce a valid "
+                        "prior-authorization decision."
+                    ),
+                    "request_id": request_id,
+                },
+            ) from exc
+
+        except Exception as exc:
+            logger.exception(
+                "Prior-authorization workflow failed. request_id=%s",
+                request_id,
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "message": (
+                        "The prior-authorization workflow failed."
+                    ),
+                    "request_id": request_id,
+                },
+            ) from exc
+
+        return DecisionResponse(
+            request_id=request_id,
+            decision=decision.decision,
+            rationale=decision.rationale,
+            cited_clauses=decision.cited_clauses,
+            missing_info=decision.missing_info,
+            retrieval_attempts=result.get(
+                "retrieval_attempts",
+                0,
+            ),
+            critique_attempts=result.get(
+                "critique_attempts",
+                0,
+            ),
+            human_review_status=result.get(
+                "human_review_status",
+                "not-required",
+            ),
         )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="The prior-authorization workflow failed.",
-        ) from exc
 
-    raw_decision = result.get("decision")
+    return application
 
-    if raw_decision is None:
-        raise HTTPException(
-            status_code=500,
-            detail="The workflow completed without producing a decision.",
-        )
 
-    if isinstance(raw_decision, dict):
-        decision = PADecision.model_validate(raw_decision)
-    else:
-        decision = raw_decision
-
-    return DecisionResponse(
-        request_id=request_id,
-        decision=decision.decision,
-        rationale=decision.rationale,
-        cited_clauses=decision.cited_clauses,
-        missing_info=decision.missing_info,
-        retrieval_attempts=result.get("r_attempts", 0),
-        critique_attempts=result.get("c_attempts", 0),
-    )
+api = create_app()
