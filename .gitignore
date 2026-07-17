@@ -1,31 +1,37 @@
-.venv/
-__pycache__/
-*.pyc
-.env
-faiss_index/
-.DS_Store
-
-# Secrets
+# Environment and secrets
 .env
 .env.*
-
-# Keep the template
 !.env.example
 
-# Python
+# Python environments and caches
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
-.ruff_cache/
-.venv/
 
-# Local vector index
+# Local vector indexes and generated data
 faiss_index/
+*.faiss
+*.pkl
+
+# Logs
+*.log
+logs/
 
 # macOS
 .DS_Store
 
-__pycache__/
-*.pyc
+# IDE settings
+.vscode/
+.idea/
+
+# Terraform local state and secrets
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
