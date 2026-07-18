@@ -1,7 +1,7 @@
-
 """FastAPI application for the prior-authorization copilot."""
-
 from __future__ import annotations
+from prior_auth.observability import install_observability
+
 
 import logging
 import uuid
@@ -51,6 +51,8 @@ def create_app(
             "human-review routing."
         ),
     )
+
+    install_observability(application)
 
     @application.get(
         "/health",
