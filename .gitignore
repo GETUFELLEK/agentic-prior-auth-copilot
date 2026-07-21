@@ -35,3 +35,4 @@ logs/
 *.tfstate
 *.tfstate.*
 *.tfvars
+.vs/
